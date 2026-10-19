@@ -2,7 +2,7 @@
 
 **Status:** In progress. Role-based access and permission testing are complete. Audit logging is next.
 
-This is Lab 2 of my identity and access management (IAM) series. [Lab 1](../ad-home-lab) covered building the domain: Windows Server 2022 domain controller, DHCP, NAT, and a domain-joined Windows 10 client. This lab builds on that environment to practice how access is designed, assigned, and verified in a real directory.
+This is Lab 2 of my identity and access management (IAM) series. [Lab 1](https://github.com/kennysp19/Active-Directory-Home-Lab) covered building the domain: Windows Server 2022 domain controller, DHCP, NAT, and a domain-joined Windows 10 client. This lab builds on that environment to practice how access is designed, assigned, and verified in a real directory.
 
 ## Goal
 
