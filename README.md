@@ -1,6 +1,6 @@
 # Active Directory IAM Lab: Role-Based Access Control
 
-**Status:** In progress. Role-based access and permission testing are complete. Audit logging is next.
+**Status:** In progress. Role-based access, permission testing, and audit logging are complete. Next up: delegation and lifecycle automation.
 
 This is Lab 2 of my identity and access management (IAM) series. [Lab 1](../ad-home-lab) covered building the domain: Windows Server 2022 domain controller, DHCP, NAT, and a domain-joined Windows 10 client. This lab builds on that environment to practice how access is designed, assigned, and verified in a real directory.
 
@@ -142,6 +142,85 @@ All results matched the design.
 ![jliem denied on Finance](screenshots/test-jliem-finance-denied.png)
 ![sjones denied on HR](screenshots/test-sjones-hr-denied.png)
 
+## Monitoring and Audit Logging
+
+Once the access model worked, I wanted to see what failure looks like in the logs. I turned on advanced auditing on the domain controller, set an account lockout policy, and used a throwaway account (`tuser`, display name "test user") to generate failed logons, a lockout, an unlock, a successful logon, and group membership changes. Times below are the domain controller's clock.
+
+### Audit and lockout settings
+
+Advanced audit policy (Default Domain Controllers Policy), Success and Failure: Credential Validation, Kerberos Authentication Service, User Account Management, Security Group Management, Logon, and Account Lockout.
+
+Lockout policy (Default Domain Policy): lock the account after 5 bad attempts, for 5 minutes, with a 5-minute reset window.
+
+A policy that is set is not always a policy that is applied, so I checked the live result with `auditpol`:
+
+```powershell
+gpupdate /force
+auditpol /get /subcategory:"Credential Validation","Kerberos Authentication Service","User Account Management","Security Group Management","Logon","Account Lockout"
+```
+
+![Audit policy: Account Logon](screenshots/gpo-audit-account-logon.png)
+![Audit policy: Account Management](screenshots/gpo-audit-account-mgmt.png)
+![Audit policy: Logon/Logoff](screenshots/gpo-audit-logon-logoff.png)
+![auditpol showing the settings in effect](screenshots/auditpol-verify.png)
+![Lockout policy from net accounts](screenshots/net-accounts.png)
+
+### Wrong passwords until lockout (10/22)
+
+I entered five wrong passwords for `tuser` on the Windows 10 client, then tried once more after the account locked.
+
+| Time | Event | What it shows |
+|---|---|---|
+| 3:30:26 to 3:30:35 | 4771 (five events) | Kerberos pre-authentication failed. The 3:30:35 event shows Failure Code `0x18`, which means a wrong password |
+| 3:30:35 | 4740 | `tuser` was locked out. The caller computer is `CLIENT01` |
+| 3:30:38 | 4771 | Failure Code `0x12`: the attempt was refused because the account was already locked out |
+
+The two codes are the useful part. `0x18` says the password was wrong, and `0x12` says the account was blocked whatever the password was. The whole sequence took about 12 seconds.
+
+![4771 with failure code 0x18](screenshots/event-4771-0x18.png)
+![4740 account lockout](screenshots/event-4740.png)
+![4771 with failure code 0x12](screenshots/event-4771-0x12.png)
+![Events pulled with Get-WinEvent](screenshots/eventlog-4771-4740-summary.png)
+![Client refusing the sign-in](screenshots/lockout-screen.png)
+
+### Unlock and successful sign-in (10/26)
+
+The lockout lasts 5 minutes by policy, so it can expire on its own. An admin unlock is logged separately as event 4767, which is why I locked the account a second time and unlocked it by hand with `Unlock-ADAccount`.
+
+After the unlock, `tuser` signed in from the client. `$env:LOGONSERVER` on the client showed `\\DC`, and the domain controller logged:
+
+- **4768**: a Kerberos ticket (TGT) was requested for `tuser`, with Result Code `0x0` (success)
+- **4624**: a successful logon for `tuser`, Logon Type 3 (network). The sign-in itself happens on the client, so the DC sees it as a network logon
+
+The `0x12` shown in the 4768 is the ticket encryption type (AES-256). It is a different field from the `0x12` failure code in the 4771.
+
+![Account unlocked, LockoutTime back to 0](screenshots/aduser-unlocked.png)
+![4767 account unlocked](screenshots/event-4767.png)
+![Client authenticated by the DC](screenshots/logonserver.png)
+![4768 ticket granted](screenshots/event-4768.png)
+![4624 successful logon](screenshots/event-4624.png)
+
+One attempt did not go cleanly: `tuser` signed in on the client while the DC showed `LockedOut: True`. I suspect the client used cached credentials, since the lockout lives on the DC, but I did not confirm that. After a clean sign-out and a fresh lockout, the client refused the correct password, as expected.
+
+### Group membership changes
+
+I added `tuser` to `Role-HR-Auditor` and removed it again. Each change was logged with the admin account that made it:
+
+- **4728**: member added to a security-enabled global group (`tuser` added to `Role-HR-Auditor` by Administrator)
+- **4729**: member removed from the same group
+
+Each change also produced a 4737 (group changed) event alongside it.
+
+![4728 member added](screenshots/event-4728.png)
+![4729 member removed](screenshots/event-4729.png)
+
+### What I took away
+
+- A burst of 4771 events against one account within seconds, followed by a 4740, is the pattern of password guessing. It is the kind of sequence an alert would key on.
+- Reading the failure code matters: `0x18` is a wrong password and `0x12` is a locked account.
+- Group changes are logged with who made them, which is the evidence trail an access review needs.
+- The same sign-in data exists in Microsoft Entra ID, so these patterns are the starting point for KQL detections later.
+
 ## Key Commands
 
 ```powershell
@@ -170,6 +249,9 @@ Get-ADGroupMember "ACC-HRShare-Modify" | Select Name, objectClass
 | Finance permissions showed "Inherited from C:\shares" | ACC groups had been added to the parent folder | Disabled inheritance and converted to explicit entries on the Finance folder |
 | `Add-ADGroupMembers` not recognized | Typo; the cmdlet name is singular | Used `Add-ADGroupMember`. Tab completion avoids this |
 | Share unreachable and "server unavailable" errors mid-test | Windows Server evaluation license expired, causing the DC to shut down periodically | Rearmed the license with `slmgr /rearm` and restarted. Lab snapshots provide a rollback point |
+| Two commands ran together as one line and PowerShell reported a positional parameter error | A multi-line paste merged the lines | Ran commands one at a time |
+| `auditpol` returned "The parameter is incorrect" | A space between `/subcategory:` and the first quote | Removed the space so the value is attached to the switch |
+| Lockout did not seem to apply on one sign-in | Likely cached credentials on the client (not confirmed) | Signed out fully, locked the account again, and confirmed the client refused the correct password |
 
 ## Lessons Learned
 
@@ -180,7 +262,8 @@ Get-ADGroupMember "ACC-HRShare-Modify" | Select Name, objectClass
 
 ## Next Steps
 
-- [ ] Enable advanced audit policy and capture events: failed logons (4625), account lockouts (4740), group membership changes (4728/4732), file access failures
+- [x] Enable advanced audit policy and capture failed logons, a lockout, an unlock, a successful logon, and group membership changes
+- [ ] Audit file access failures on the HR and Finance shares
 - [ ] Delegate password reset on the user OUs to `ACC-HelpdeskResetPW`
 - [ ] Automate joiner/mover/leaver processes in PowerShell
 - [ ] Sync the domain to Microsoft Entra ID with Entra Connect and add Conditional Access and MFA
